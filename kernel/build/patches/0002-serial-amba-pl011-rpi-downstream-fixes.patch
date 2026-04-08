@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Bjarni Coenen <bjarni@coenen.dev>
+Date: Mon, 7 Apr 2026 00:00:00 +0000
+Subject: [PATCH 2/3] serial: amba-pl011: RPi downstream fixes for RP1 serial
+ reliability
+
+Cherry-picked fixes from the RPi/RevPi downstream kernel
+(revolutionpi/linux devel/revpi-6.18) to improve PL011 UART
+reliability on RPi5/RP1-based platforms:
+
+- Insert mb() after DR write for correct FIFO ordering (Phil Elwell)
+- Avoid rare write-when-full error on last TX char (Phil Elwell)
+- Add DMA dst_addr_width for RX slave config (Phil Elwell)
+- Cap DMA RX burst to controller max capability (Phil Elwell)
+- Add cts-event-workaround DT property for AMBA probe (Phil Elwell)
+
+Upstream commits from revolutionpi/linux:
+  806a1f4eaac5 ("amba_pl011: Insert mb() for correct FIFO handling")
+  a8a248388de0 ("tty: amba-pl011: Avoid rare write-when-full error")
+  091e870a71f7 ("serial: pl011: Request a memory width of 1 byte")
+  9c6dd5502ad1 ("serial: pl011: rp1 uart support") [DMA burst subset]
+  6cd2328100e1 ("amba_pl011: Add cts-event-workaround DT property")
+
+Signed-off-by: Bjarni Coenen <bjarni@coenen.dev>
+---
+ drivers/tty/serial/amba-pl011.c | 24 +++++++++++++++++++++++-
+ 1 file changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/tty/serial/amba-pl011.c b/drivers/tty/serial/amba-pl011.c
+--- a/drivers/tty/serial/amba-pl011.c
++++ b/drivers/tty/serial/amba-pl011.c
+@@ -473,6 +473,7 @@
+ 		struct dma_slave_config rx_conf = {
+ 			.src_addr = uap->port.mapbase +
+ 				pl011_reg_to_offset(uap, REG_DR),
+ 			.src_addr_width = DMA_SLAVE_BUSWIDTH_1_BYTE,
++			.dst_addr_width = DMA_SLAVE_BUSWIDTH_1_BYTE,
+ 			.direction = DMA_DEV_TO_MEM,
+ 			.src_maxburst = uap->fifosize >> 2,
+ 			.device_fc = false,
+@@ -493,6 +494,12 @@
+ 				dev_info(uap->port.dev,
+ 					 "RX DMA disabled - no residue processing\n");
+ 				return;
+ 			}
++			/*
++			 * DMA controllers with smaller burst capabilities than 1/4
++			 * the FIFO depth will leave more bytes than expected in the
++			 * RX FIFO if mismatched.
++			 */
++			rx_conf.src_maxburst = min(caps.max_burst, rx_conf.src_maxburst);
+ 		}
+ 
+ 		dmaengine_slave_config(chan, &rx_conf);
+@@ -1497,6 +1504,7 @@
+ 		return false; /* unable to transmit character */
+ 
+ 	pl011_write(c, uap, REG_DR);
++	mb();
+ 	uap->port.icount.tx++;
+ 
+ 	return true;
+@@ -1528,6 +1536,10 @@
+ 		if (likely(from_irq) && count-- == 0)
+ 			break;
+ 
++		if (likely(from_irq) && count == 0 &&
++		    pl011_read(uap, REG_FR) & UART01x_FR_TXFF)
++			break;
++
+ 		if (!kfifo_peek(&tport->xmit_fifo, &c))
+ 			break;
+ 
+@@ -2950,6 +2962,11 @@
+ 	if (IS_ERR(uap->clk))
+ 		return PTR_ERR(uap->clk);
+ 
++	if (of_property_read_bool(dev->dev.of_node, "cts-event-workaround")) {
++		vendor->cts_event_workaround = true;
++		dev_info(&dev->dev, "cts_event_workaround enabled\n");
++	}
++
+ 	uap->reg_offset = vendor->reg_offset;
+ 	uap->vendor = vendor;
+ 	uap->fifosize = vendor->get_fifosize(dev);
+-- 
+2.43.0
+

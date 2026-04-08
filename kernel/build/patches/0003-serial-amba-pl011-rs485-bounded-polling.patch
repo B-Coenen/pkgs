@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Bjarni Coenen <bjarni@coenen.dev>
+Date: Mon, 7 Apr 2026 00:00:00 +0000
+Subject: [PATCH 3/3] serial: amba-pl011: Add RS485 bounded polling for TX drain
+
+Add configurable bounded polling for RS485 TX drain to avoid
+excessive hrtimer latency on RP1/RevPi Connect 5 platforms.
+
+When the DT property "rs485-tx-drain-poll" is set, the driver
+will attempt a bounded busy-poll to wait for the TX FIFO to drain
+before falling back to the hrtimer-based approach. An optional
+"rs485-tx-drain-timeout-us" property allows explicit timeout
+override; otherwise it is auto-calculated from the FIFO depth
+and baud rate.
+
+Cherry-picked from revolutionpi/linux devel/revpi-6.18:
+  adbecee5c9b3 ("serial: pl011: Add configurable bounded polling
+                  for RS485 TX drain")
+
+Signed-off-by: Bjarni Coenen <bjarni@coenen.dev>
+---
+ drivers/tty/serial/amba-pl011.c | 42 +++++++++++++++++++++++++++++++++
+ 1 file changed, 42 insertions(+)
+
+diff --git a/drivers/tty/serial/amba-pl011.c b/drivers/tty/serial/amba-pl011.c
+--- a/drivers/tty/serial/amba-pl011.c
++++ b/drivers/tty/serial/amba-pl011.c
+@@ -287,6 +287,8 @@
+ 	struct hrtimer		trigger_start_tx;
+ 	struct hrtimer		trigger_stop_tx;
+ 	bool			console_line_ended;
++	bool rs485_tx_drain_poll;		/* use bounded polling */
++	unsigned int rs485_tx_drain_timeout_us; /* explicit override, 0 = auto */
+ #ifdef CONFIG_DMA_ENGINE
+ 	/* DMA stuff */
+ 	unsigned int		dmacr;		/* dma control reg */
+@@ -1289,6 +1291,19 @@
+ #define pl011_dma_flush_buffer	NULL
+ #endif
+ 
++static unsigned int pl011_rs485_tx_drain_timeout(struct uart_amba_port *uap)
++{
++	if (uap->rs485_tx_drain_timeout_us > 0)
++		return uap->rs485_tx_drain_timeout_us;
++
++	/*
++	 * Auto-calculate based on FIFO depth plus one character
++	 * in the shift register.
++	 */
++	return div_u64(ktime_to_ns(uap->rs485_tx_drain_interval) *
++		       (uap->fifosize + 1), NSEC_PER_USEC);
++}
++
+ static void pl011_rs485_tx_stop(struct uart_amba_port *uap)
+ {
+ 	struct uart_port *port = &uap->port;
+@@ -1300,6 +1315,19 @@
+ 		uap->rs485_tx_state = WAIT_AFTER_SEND;
+ 
+ 	if (uap->rs485_tx_state == WAIT_AFTER_SEND) {
++		if (uap->rs485_tx_drain_poll) {
++			/* Bounded spin with auto-calculated or explicit timeout */
++			unsigned int timeout_us = pl011_rs485_tx_drain_timeout(uap);
++			ktime_t deadline = ktime_add_us(ktime_get(), timeout_us);
++
++			while (!pl011_tx_empty(port)) {
++				if (ktime_after(ktime_get(), deadline)) {
++					/* Timeout - fall back to hrtimer */
++					break;
++				}
++				cpu_relax();
++			}
++		}
+ 		/* Schedule hrtimer if tx queue not empty */
+ 		if (!pl011_tx_empty(port)) {
+ 			hrtimer_start(&uap->trigger_stop_tx,
+@@ -2974,6 +3002,11 @@
+ 	hrtimer_setup(&uap->trigger_stop_tx, pl011_trigger_stop_tx, CLOCK_MONOTONIC,
+ 		      HRTIMER_MODE_REL);
+ 
++	uap->rs485_tx_drain_poll = device_property_read_bool(&dev->dev,
++			"rs485-tx-drain-poll");
++	device_property_read_u32(&dev->dev, "rs485-tx-drain-timeout-us",
++			&uap->rs485_tx_drain_timeout_us);
++
+ 	ret = pl011_setup_port(&dev->dev, uap, &dev->res, portnr);
+ 	if (ret)
+ 		return ret;
+@@ -3106,6 +3139,11 @@
+ 	hrtimer_setup(&uap->trigger_stop_tx, pl011_trigger_stop_tx, CLOCK_MONOTONIC,
+ 		      HRTIMER_MODE_REL);
+ 
++	uap->rs485_tx_drain_poll = device_property_read_bool(&pdev->dev,
++			"rs485-tx-drain-poll");
++	device_property_read_u32(&pdev->dev, "rs485-tx-drain-timeout-us",
++			&uap->rs485_tx_drain_timeout_us);
++
+ 	ret = pl011_setup_port(&pdev->dev, uap, r, portnr);
+ 	if (ret)
+ 		return ret;
+-- 
+2.43.0
+

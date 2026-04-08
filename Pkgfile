@@ -60,6 +60,11 @@ vars:
   gasket_driver_sha256: 90cb41d10df702ec63b86968e1e7123abef6df1fdef5e7e2138d57618efbffde
   gasket_driver_sha512: e981c8e7dd72efa0ba5cb03f9b851949d0241cb8c438a93a07ba78aad44ad4103caad9075f0b0f4caa3c742de67be1e667a881f08f542d615dd3af57a0cac562
 
+  # renovate: datasource=gitlab-tags depName=revolutionpi/piControl registryUrl=https://gitlab.com
+  picontrol_version: v2.6.0
+  picontrol_sha256: f449ee72cd603c5cca566efdc7c736d94122a76246029b9812036d3c62052a4c
+  picontrol_sha512: 66329f6e7930acee19794cb93370563fde12377e8e133572a4926f1cc1c64c38db3384b5227bfd538025b587e341aca669d7a97b37aef84bea6201f5c9ed8166
+
   # renovate: datasource=git-tags extractVersion=^grub-(?<version>.*)$ depName=git://git.savannah.gnu.org/grub.git
   grub_version: 2.14
   grub_sha256: bc8d3c73535b8838d8c8e2654d73edc4e6ae8c8acdb45d5df5dc9a1547446d43
