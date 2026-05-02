@@ -1,0 +1,62 @@
+From: Nicolai Buchwitz <nb@tiber.science>
+Date: Mon, 10 Mar 2026 00:00:00 +0000
+Subject: [PATCH] net: phy: broadcom: disable AutogrEEEn and EEE on BCM54xx
+
+The BCM54213PE (and other BCM54xx) PHY defaults to AutogrEEEn mode,
+which causes the PHY to autonomously enter Low Power Idle (LPI) state.
+When paired with a MAC that does not support EEE (like Cadence GEM/macb
+on RPi5/CM5/RP1), this leads to silent packet loss and eventual network
+death because the MAC cannot handle the LPI transitions.
+
+Even with AutogrEEEn disabled and the PHY switched to Native EEE mode,
+EEE is still advertised during autonegotiation. If the link partner
+negotiates EEE and sends LPI frames, the MACB MAC cannot process
+incoming LPI on the RGMII interface, causing the TX queue to stall and
+resulting in DNS resolution timeouts and other connectivity loss.
+
+Disable AutogrEEEn mode during PHY init and suppress EEE advertisement
+entirely via phy_disable_eee() so that EEE is never negotiated.
+
+Based on the fix from raspberrypi/linux PR #7270 by Nicolai Buchwitz.
+
+Signed-off-by: Nicolai Buchwitz <nb@tiber.science>
+---
+ drivers/net/phy/broadcom.c | 12 ++++++++++++
+ include/linux/brcmphy.h    |  3 +++
+ 2 files changed, 15 insertions(+)
+
+diff --git a/drivers/net/phy/broadcom.c b/drivers/net/phy/broadcom.c
+--- a/drivers/net/phy/broadcom.c
++++ b/drivers/net/phy/broadcom.c
+@@ -487,6 +487,18 @@ static int bcm54xx_config_init(struct phy_device *phydev)
+ 		bcm_phy_write_shadow(phydev, BCM54XX_SHD_RGMII_MODE, 0);
+ 
+ 
++	/* Disable AutogrEEEn and switch to Native EEE mode so the MAC
++	 * can control LPI signaling and observe RX LPI on the RGMII
++	 * interface.
++	 */
++	err = bcm_phy_modify_exp(phydev, BCM54XX_TOP_MISC_MII_BUF_CNTL0,
++				 BCM54XX_MII_BUF_CNTL0_AUTOGREEEN_EN, 0);
++	if (err)
++		return err;
++
++	/* Do not advertise EEE — the MACB/GEM MAC cannot handle LPI. */
++	phy_disable_eee(phydev);
++
+ 	bcm54xx_adjust_rxrefclk(phydev);
+ 
+ 	switch (phydev->drv->phy_id & PHY_ID_MATCH_MODEL_MASK) {
+diff --git a/include/linux/brcmphy.h b/include/linux/brcmphy.h
+--- a/include/linux/brcmphy.h
++++ b/include/linux/brcmphy.h
+@@ -187,6 +187,9 @@
+ #define BCM54XX_TOP_MISC_IDDQ_SR		(1 << 3)
+ 
+ #define BCM54XX_TOP_MISC_LED_CTL		(MII_BCM54XX_EXP_SEL_TOP + 0x0C)
++#define BCM54XX_TOP_MISC_MII_BUF_CNTL0		(MII_BCM54XX_EXP_SEL_TOP + 0x00)
++#define BCM54XX_MII_BUF_CNTL0_AUTOGREEEN_EN	BIT(0)
++
+ #define  BCM54XX_LED4_SEL_INTR			BIT(1)
+ 
+ /*

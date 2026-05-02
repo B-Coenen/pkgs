@@ -1,0 +1,1614 @@
+From 7f7b000426e8c192dddfe00631d16dc2c5d18583 Mon Sep 17 00:00:00 2001
+From: patch <patch@local>
+Date: Tue, 7 Apr 2026 13:46:11 +0200
+Subject: [PATCH] serial: serdev: add PiBridge serial device driver for RevPi
+
+Add the PiBridge serdev driver used by Revolution Pi (RevPi) devices to
+communicate with I/O extension modules (DIO, AIO, etc.) over the PiBridge
+serial bus.
+
+The driver provides the low-level serial communication layer that the
+piControl out-of-tree module uses to exchange data with RevPi digital and
+analog I/O modules connected via the PiBridge connector.
+
+Components:
+- drivers/tty/serdev/pibridge.c: Main driver with IO and gate protocol
+- drivers/tty/serdev/pibridge.h: Internal header for packet structures
+- drivers/tty/serdev/pibridge_trace.h: Ftrace tracing support
+- include/linux/pibridge_comm.h: Public API header for piControl module
+
+Source: https://gitlab.com/revolutionpi/linux/-/tree/devel/revpi-6.18
+Signed-off-by: Local Build <local@build>
+---
+ drivers/tty/serdev/Kconfig          |   7 +
+ drivers/tty/serdev/Makefile         |   3 +
+ drivers/tty/serdev/pibridge.c       | 995 ++++++++++++++++++++++++++++
+ drivers/tty/serdev/pibridge.h       |  16 +
+ drivers/tty/serdev/pibridge_trace.h | 436 ++++++++++++
+ include/linux/pibridge_comm.h       |  79 +++
+ 6 files changed, 1536 insertions(+)
+ create mode 100644 drivers/tty/serdev/pibridge.c
+ create mode 100644 drivers/tty/serdev/pibridge.h
+ create mode 100644 drivers/tty/serdev/pibridge_trace.h
+ create mode 100644 include/linux/pibridge_comm.h
+
+diff --git a/drivers/tty/serdev/Kconfig b/drivers/tty/serdev/Kconfig
+index 46ae732..7c3972e 100644
+--- a/drivers/tty/serdev/Kconfig
++++ b/drivers/tty/serdev/Kconfig
+@@ -22,4 +22,11 @@ config SERIAL_DEV_CTRL_TTYPORT
+ 	depends on SERIAL_DEV_BUS != m
+ 	default y
+ 
++config SERIAL_DEV_MUX_PIBRIDGE
++        tristate "PiBridge"
++        help
++          Say Y here if you want to use the PiBridge bus.
++
++          If unsure, say N.
++
+ endif
+diff --git a/drivers/tty/serdev/Makefile b/drivers/tty/serdev/Makefile
+index 078417e..3323ec2 100644
+--- a/drivers/tty/serdev/Makefile
++++ b/drivers/tty/serdev/Makefile
+@@ -4,3 +4,6 @@ serdev-objs := core.o
+ obj-$(CONFIG_SERIAL_DEV_BUS) += serdev.o
+ 
+ obj-$(CONFIG_SERIAL_DEV_CTRL_TTYPORT) += serdev-ttyport.o
++obj-$(CONFIG_SERIAL_DEV_MUX_PIBRIDGE) += pibridge.o
++
++CFLAGS_pibridge.o = -I$(src)
+diff --git a/drivers/tty/serdev/pibridge.c b/drivers/tty/serdev/pibridge.c
+new file mode 100644
+index 0000000..c8c0e74
+--- /dev/null
++++ b/drivers/tty/serdev/pibridge.c
+@@ -0,0 +1,995 @@
++#include <linux/errno.h>
++#include <linux/kfifo.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/serdev.h>
++#include <linux/pibridge_comm.h>
++#include <linux/wait.h>
++#include <linux/kstrtox.h>
++
++#include "pibridge.h"
++
++#define CREATE_TRACE_POINTS
++#include "pibridge_trace.h"
++
++#define PIBRIDGE_BAUDRATE		115200
++#define PIBRIDGE_IO_TIMEOUT		10         // msec
++#define PIBRIDGE_GATE_TIMEOUT		35         // msec
++#define PIBRIDGE_BC_ADDR		0xff
++
++#define PIBRIDGE_RESP_CMD		0x3fff
++#define PIBRIDGE_RESP_OK		0x4000
++#define PIBRIDGE_RESP_ERR		0x8000
++
++DEFINE_MUTEX(pibridge_dev_mutex);
++
++static int pibridge_baudrate = PIBRIDGE_BAUDRATE;
++static int pibridge_io_timeout = PIBRIDGE_IO_TIMEOUT;
++
++static struct pibridge *pibridge_s; /* unique instance of the pibridge */
++
++#define PIBRIDGE_GET_STATS(st, counter)				\
++{									\
++	unsigned int start;						\
++	do {								\
++		start = u64_stats_fetch_begin(&(pibridge_s->stats).syncp);  \
++		st = pibridge_s->stats.counter;				\
++	} while (u64_stats_fetch_retry(&(pibridge_s->stats).syncp, start)); \
++}
++
++#define PIBRIDGE_ADD_STATS(counter, num)				\
++do {									\
++	u64_stats_update_begin(&(pibridge_s->stats).syncp);		\
++	pibridge_s->stats.counter += num;				\
++	u64_stats_update_end(&(pibridge_s->stats).syncp);		\
++} while (0)
++
++
++#define PIBRIDGE_INC_STATS(counter) PIBRIDGE_ADD_STATS(counter, 1)
++
++#define pibridge_stats_attr(field, format_string)			\
++static ssize_t stat_##field##_show(struct device_driver *drv, char *buf)	\
++{									\
++	u64 counter;							\
++	PIBRIDGE_GET_STATS(counter, field);				\
++	return sysfs_emit(buf, "%llu\n", counter);			\
++}
++
++pibridge_stats_attr(tx_bytes, "%u\n");
++pibridge_stats_attr(tx_err, "%u\n");
++pibridge_stats_attr(tx_io_err, "%u\n");
++pibridge_stats_attr(tx_gate_err, "%u\n");
++pibridge_stats_attr(rx_bytes, "%u\n");
++pibridge_stats_attr(rx_err, "%u\n");
++pibridge_stats_attr(rx_gate_hdr_err, "%u\n");
++pibridge_stats_attr(rx_gate_data_err, "%u\n");
++pibridge_stats_attr(rx_gate_crc_err, "%u\n");
++pibridge_stats_attr(rx_gate_crc_inval, "%u\n");
++pibridge_stats_attr(rx_gate_format_inval, "%u\n");
++pibridge_stats_attr(rx_gate_discarded, "%u\n");
++pibridge_stats_attr(rx_gate_remote_err, "%u\n");
++pibridge_stats_attr(rx_io_hdr_err, "%u\n");
++pibridge_stats_attr(rx_io_data_err, "%u\n");
++pibridge_stats_attr(rx_io_crc_err, "%u\n");
++pibridge_stats_attr(rx_io_crc_inval, "%u\n");
++pibridge_stats_attr(rx_io_format_inval, "%u\n");
++pibridge_stats_attr(rx_io_discarded, "%u\n");
++
++static DRIVER_ATTR_RO(stat_tx_bytes);
++static DRIVER_ATTR_RO(stat_tx_err);
++static DRIVER_ATTR_RO(stat_rx_bytes);
++static DRIVER_ATTR_RO(stat_rx_err);
++static DRIVER_ATTR_RO(stat_tx_io_err);
++static DRIVER_ATTR_RO(stat_tx_gate_err);
++static DRIVER_ATTR_RO(stat_rx_gate_hdr_err);
++static DRIVER_ATTR_RO(stat_rx_gate_data_err);
++static DRIVER_ATTR_RO(stat_rx_gate_crc_err);
++static DRIVER_ATTR_RO(stat_rx_gate_crc_inval);
++static DRIVER_ATTR_RO(stat_rx_gate_format_inval);
++static DRIVER_ATTR_RO(stat_rx_gate_discarded);
++static DRIVER_ATTR_RO(stat_rx_gate_remote_err);
++static DRIVER_ATTR_RO(stat_rx_io_hdr_err);
++static DRIVER_ATTR_RO(stat_rx_io_data_err);
++static DRIVER_ATTR_RO(stat_rx_io_crc_err);
++static DRIVER_ATTR_RO(stat_rx_io_crc_inval);
++static DRIVER_ATTR_RO(stat_rx_io_format_inval);
++static DRIVER_ATTR_RO(stat_rx_io_discarded);
++
++static struct attribute *pibridge_drv_stats_attrs[] = {
++	&driver_attr_stat_tx_bytes.attr,
++	&driver_attr_stat_tx_err.attr,
++	&driver_attr_stat_tx_io_err.attr,
++	&driver_attr_stat_tx_gate_err.attr,
++	&driver_attr_stat_rx_bytes.attr,
++	&driver_attr_stat_rx_err.attr,
++	&driver_attr_stat_rx_gate_hdr_err.attr,
++	&driver_attr_stat_rx_gate_data_err.attr,
++	&driver_attr_stat_rx_gate_crc_err.attr,
++	&driver_attr_stat_rx_gate_crc_inval.attr,
++	&driver_attr_stat_rx_gate_format_inval.attr,
++	&driver_attr_stat_rx_gate_discarded.attr,
++	&driver_attr_stat_rx_gate_remote_err.attr,
++	&driver_attr_stat_rx_io_hdr_err.attr,
++	&driver_attr_stat_rx_io_data_err.attr,
++	&driver_attr_stat_rx_io_crc_err.attr,
++	&driver_attr_stat_rx_io_crc_inval.attr,
++	&driver_attr_stat_rx_io_format_inval.attr,
++	&driver_attr_stat_rx_io_discarded.attr,
++	NULL,
++};
++
++static const struct attribute_group pibridge_drv_stats_group = {
++	.name = "stats",
++	.attrs = pibridge_drv_stats_attrs,
++};
++
++static ssize_t reset_stats_store(struct device_driver *drv, const char *buf,
++				 size_t count)
++{
++	unsigned long val;
++
++	if (kstrtoul(buf, 10, &val))
++		return -EINVAL;
++
++	if (val != 1)
++		return -EINVAL;
++
++	u64_stats_update_begin(&(pibridge_s->stats).syncp);
++	pibridge_s->stats.tx_bytes = 0;
++	pibridge_s->stats.tx_err = 0;
++	pibridge_s->stats.tx_io_err = 0;
++	pibridge_s->stats.tx_gate_err = 0;
++	pibridge_s->stats.rx_bytes = 0;
++	pibridge_s->stats.rx_err = 0;
++	pibridge_s->stats.rx_gate_hdr_err = 0;
++	pibridge_s->stats.rx_gate_data_err = 0;
++	pibridge_s->stats.rx_gate_crc_err = 0;
++	pibridge_s->stats.rx_gate_crc_inval = 0;
++	pibridge_s->stats.rx_gate_format_inval = 0;
++	pibridge_s->stats.rx_gate_discarded = 0;
++	pibridge_s->stats.rx_gate_remote_err = 0;
++	pibridge_s->stats.rx_io_hdr_err = 0;
++	pibridge_s->stats.rx_io_data_err = 0;
++	pibridge_s->stats.rx_io_crc_err = 0;
++	pibridge_s->stats.rx_io_crc_inval = 0;
++	pibridge_s->stats.rx_io_format_inval = 0;
++	pibridge_s->stats.rx_io_discarded = 0;
++	u64_stats_update_end(&(pibridge_s->stats).syncp);
++
++	return count;
++}
++
++static DRIVER_ATTR_WO(reset_stats);
++
++static struct attribute *pibridge_drv_attrs[] = {
++	&driver_attr_reset_stats.attr,
++	NULL,
++};
++
++static const struct attribute_group pibridge_drv_group = {
++	.attrs = pibridge_drv_attrs,
++};
++
++static const struct attribute_group *pibridge_drv_groups[] = {
++	&pibridge_drv_group,
++	&pibridge_drv_stats_group,
++	NULL,
++};
++
++static u8 pibridge_crc8(u8 base, void *data, u16 len)
++{
++	u8 ret = base;
++
++	while (len--)
++		ret = ret ^ ((u8 *)data)[len];
++	return ret;
++}
++
++static size_t pibridge_receive_buf(struct serdev_device *serdev,
++				const unsigned char *buf, size_t count)
++{
++	struct pibridge *pi = serdev_device_get_drvdata(serdev);
++	size_t ret;
++
++	mutex_lock(&pi->lock);
++	ret = kfifo_in(&pi->read_fifo, buf, count);
++	mutex_unlock(&pi->lock);
++
++	trace_pibridge_wakeup_receive_buffer(buf, count);
++	wake_up(&pi->read_queue);
++
++	if (ret < count)
++		dev_warn_ratelimited(&serdev->dev,
++			"failed to fill receive fifo (received: %zu, filled: %zu)\n",
++			count, ret);
++	return ret;
++}
++
++static void pibridge_write_wakeup(struct serdev_device *serdev)
++{
++	trace_pibridge_wakeup_write(serdev);
++	serdev_device_write_wakeup(serdev);
++}
++
++static const struct serdev_device_ops pibridge_serdev_ops = {
++	.receive_buf	= pibridge_receive_buf,
++	.write_wakeup	= pibridge_write_wakeup,
++};
++
++static int pibridge_set_serial(struct serdev_device *serdev)
++{
++	if (pibridge_baudrate != PIBRIDGE_BAUDRATE)
++		dev_warn(&serdev->dev, "Using non-standard baudrate: %d (default: %d)\n",
++		         pibridge_baudrate, PIBRIDGE_BAUDRATE);
++	serdev_device_set_baudrate(serdev, pibridge_baudrate);
++	/* RTS is used to drive Transmit Enable pin, hence no flow control */
++	serdev_device_set_flow_control(serdev, false);
++	return serdev_device_set_parity(serdev, SERDEV_PARITY_EVEN);
++}
++
++static int pibridge_discard_timeout(struct pibridge *pi, u16 len, u16 timeout)
++{
++	unsigned int discarded;
++	int ret = 0;
++
++	wait_event_hrtimeout(pi->read_queue,
++			     kfifo_len(&pi->read_fifo) >= len,
++			     ms_to_ktime(timeout));
++
++	mutex_lock(&pi->lock);
++	discarded = kfifo_len(&pi->read_fifo);
++	trace_pibridge_discard_data(&pi->read_fifo);
++	kfifo_reset(&pi->read_fifo);
++	mutex_unlock(&pi->lock);
++
++	if (discarded < len) {
++		trace_pibridge_discard_timeout(discarded, len, timeout);
++		ret = -1;
++	}
++
++	return ret;
++}
++
++static int pibridge_probe(struct serdev_device *serdev)
++{
++	struct device *dev = &serdev->dev;
++	struct pibridge *pi;
++	int ret;
++
++	pi = devm_kzalloc(dev, sizeof(*pi), GFP_KERNEL);
++	if (!pi)
++		return -ENOMEM;
++
++	pi->serdev = serdev;
++
++	u64_stats_init(&pi->stats.syncp);
++
++	serdev_device_set_drvdata(serdev, pi);
++	serdev_device_set_client_ops(serdev, &pibridge_serdev_ops);
++
++	mutex_init(&pi->lock);
++	init_waitqueue_head(&pi->read_queue);
++
++	ret = kfifo_alloc(&pi->read_fifo, PIBRIDGE_RECV_FIFO_SIZE, GFP_KERNEL);
++	if (ret)
++		return ret;
++
++	ret = serdev_device_open(serdev);
++	if (ret) {
++		dev_err(&serdev->dev, "failed to open serdev: %i\n", ret);
++		goto err_kfifo_free;
++	}
++
++	ret = pibridge_set_serial(serdev);
++	if (ret) {
++		dev_err(&serdev->dev,
++			"failed to set serial parameters: %i\n", ret);
++		goto err_serdev_close;
++	}
++
++	if (pibridge_io_timeout != PIBRIDGE_IO_TIMEOUT)
++		dev_warn(&serdev->dev, "Using non-standard io timeout: %d (default: %d)\n",
++		         pibridge_io_timeout, PIBRIDGE_IO_TIMEOUT);
++
++	dev_info(&serdev->dev, "pibridge initialized\n");
++
++	mutex_lock(&pibridge_dev_mutex);
++	pibridge_s = pi;
++	mutex_unlock(&pibridge_dev_mutex);
++
++	return 0;
++
++err_serdev_close:
++	serdev_device_close(serdev);
++err_kfifo_free:
++	kfifo_free(&pi->read_fifo);
++
++	dev_err(&serdev->dev, "failed to initialize pibridge\n");
++
++	return ret;
++}
++
++static void pibridge_remove(struct serdev_device *serdev)
++{
++	struct pibridge *pi = serdev_device_get_drvdata(serdev);
++
++	mutex_lock(&pibridge_dev_mutex);
++	pibridge_s = NULL;
++	mutex_unlock(&pibridge_dev_mutex);
++
++	serdev_device_close(serdev);
++	kfifo_free(&pi->read_fifo);
++};
++
++/*****************/
++static int pibridge_send_locked(struct pibridge *pi, void *buf, u32 len)
++{
++	struct serdev_device *serdev = pi->serdev;
++	int ret;
++
++	trace_pibridge_send_begin(buf, len);
++
++	ret = serdev_device_write(serdev, buf, len, MAX_SCHEDULE_TIMEOUT);
++	serdev_device_wait_until_sent(serdev, 0);
++
++	if (ret >= 0)
++		PIBRIDGE_ADD_STATS(tx_bytes, ret);
++	if (ret != len)
++		PIBRIDGE_INC_STATS(tx_err);
++
++	trace_pibridge_send_end(ret);
++
++	return ret;
++}
++
++int pibridge_send(struct pibridge *pi, void *buf, u32 len)
++{
++	int ret;
++
++	mutex_lock(&pibridge_dev_mutex);
++	ret = pibridge_send_locked(pi, buf, len);
++	mutex_unlock(&pibridge_dev_mutex);
++
++	return ret;
++}
++EXPORT_SYMBOL(pibridge_send);
++
++void pibridge_clear_fifo(struct pibridge *pi)
++{
++	mutex_lock(&pi->lock);
++	kfifo_reset(&pi->read_fifo);
++	mutex_unlock(&pi->lock);
++}
++EXPORT_SYMBOL(pibridge_clear_fifo);
++
++static int pibridge_recv_timeout_locked(struct pibridge *pi, void *buf, u8 len,
++				 u16 timeout)
++{
++	unsigned int received;
++
++	trace_pibridge_receive_begin(len);
++
++	wait_event_hrtimeout(pi->read_queue, kfifo_len(&pi->read_fifo) >= len,
++			     ms_to_ktime(timeout));
++
++	mutex_lock(&pi->lock);
++	received = kfifo_out(&pi->read_fifo, buf, len);
++	mutex_unlock(&pi->lock);
++
++	trace_pibridge_receive_end(buf, received);
++
++	if (received != len) {
++		trace_pibridge_receive_timeout(received, len, timeout);
++		PIBRIDGE_INC_STATS(rx_err);
++	}
++	PIBRIDGE_ADD_STATS(rx_bytes, received);
++
++	return received;
++}
++
++int pibridge_recv_timeout(struct pibridge *pi, void *buf, u8 len, u16 timeout)
++{
++	int ret;
++
++	mutex_lock(&pibridge_dev_mutex);
++	ret = pibridge_recv_timeout_locked(pi, buf, len, timeout);
++	mutex_unlock(&pibridge_dev_mutex);
++
++	return ret;
++}
++EXPORT_SYMBOL(pibridge_recv_timeout);
++
++static int pibridge_recv_locked(struct pibridge *pi, void *buf, u8 len)
++{
++	/* using default timeout pibridge_io_timeout */
++	return pibridge_recv_timeout_locked(pi, buf, len, pibridge_io_timeout);
++}
++
++int pibridge_recv(struct pibridge *pi, void *buf, u8 len)
++{
++	int ret;
++
++	mutex_lock(&pibridge_dev_mutex);
++	ret = pibridge_recv_locked(pi, buf, len);
++	mutex_unlock(&pibridge_dev_mutex);
++
++	return ret;
++}
++EXPORT_SYMBOL(pibridge_recv);
++
++static int pibridge_req_send_gate_locked(struct pibridge *pi, u8 dst, u16 cmd,
++					 void *snd_buf, u8 buf_len)
++{
++	struct serdev_device *serdev = pi->serdev;
++	struct pibridge_pkthdr_gate *hdr;
++	size_t datagram_size;
++	void *datagram;
++	int ret = 0;
++	u8 crc;
++
++	datagram_size = sizeof(*hdr) + buf_len + PIBRIDGE_CRC_LEN;
++
++	datagram = kmalloc(datagram_size, GFP_KERNEL);
++	if (!datagram) {
++		PIBRIDGE_INC_STATS(tx_gate_err);
++		PIBRIDGE_INC_STATS(tx_err);
++		return -ENOMEM;
++	}
++
++	hdr = (struct pibridge_pkthdr_gate *) datagram;
++	hdr->dst = dst;
++	hdr->src = 0;
++	hdr->cmd = cmd;
++	hdr->seq = 0;
++	hdr->len = buf_len;
++
++	crc = pibridge_crc8(0, hdr, sizeof(*hdr));
++
++	if (buf_len) {
++		memcpy(datagram + sizeof(*hdr), snd_buf, buf_len);
++		crc = pibridge_crc8(crc, snd_buf, buf_len);
++	}
++
++	memcpy(datagram + sizeof(*hdr) + buf_len, &crc, sizeof(crc));
++
++	if (pibridge_send_locked(pi, datagram, datagram_size) < 0) {
++		PIBRIDGE_INC_STATS(tx_gate_err);
++		dev_dbg(&serdev->dev, "failed to send gate-datagram\n");
++		ret = -EIO;
++	}
++
++	kfree(datagram);
++
++	return ret;
++}
++
++int pibridge_req_send_gate(struct pibridge *pi, u8 dst, u16 cmd, void *snd_buf,
++			   u8 buf_len)
++{
++	int ret;
++
++	mutex_lock(&pibridge_dev_mutex);
++	ret = pibridge_req_send_gate_locked(pi, dst, cmd, snd_buf, buf_len);
++	mutex_unlock(&pibridge_dev_mutex);
++
++	return ret;
++}
++EXPORT_SYMBOL(pibridge_req_send_gate);
++
++static int pibridge_req_gate_datagram_locked(struct pibridge *pi,
++					     struct pibridge_gate_datagram *req,
++					     struct pibridge_gate_datagram *resp)
++{
++	struct serdev_device *serdev = pi->serdev;
++	u8 to_receive;
++	u8 to_send;
++	u8 exp_crc;
++	int ret;
++	u8 crc;
++
++	/* Read fifo may contain stale data, so clear it first. */
++	pibridge_clear_fifo(pi);
++
++	crc = pibridge_crc8(0, &req->hdr, sizeof(req->hdr));
++
++	if (req->hdr.len)
++		crc = pibridge_crc8(crc, req->data, req->hdr.len);
++
++	/* Set CRC in request. */
++	req->data[req->hdr.len] = crc;
++	to_send = sizeof(req->hdr) + req->hdr.len + PIBRIDGE_CRC_LEN;
++
++	ret = pibridge_send_locked(pi, req, to_send);
++	if (ret != to_send) {
++		dev_dbg(&serdev->dev,
++			"failed to send gate-datagram: (to send: %i, returned: %i)\n",
++			to_send, ret);
++		PIBRIDGE_INC_STATS(tx_gate_err);
++		return -EIO;
++	}
++	/* Do not wait for a response in case of a broadcast address. */
++	if (req->hdr.dst == PIBRIDGE_BC_ADDR)
++		return 0;
++
++	if (pibridge_recv_timeout_locked(pi, &resp->hdr, sizeof(resp->hdr),
++					 pibridge_io_timeout) != sizeof(resp->hdr)) {
++		dev_dbg(&serdev->dev,
++			"receive head error in gate-resp(hdr_len: %zd, timeout: %d)\n",
++			sizeof(resp->hdr), pibridge_io_timeout);
++		PIBRIDGE_INC_STATS(rx_gate_hdr_err);
++		return -EIO;
++	}
++
++	trace_pibridge_receive_gate_header(&resp->hdr);
++
++	if ((resp->hdr.cmd & PIBRIDGE_RESP_CMD) != req->hdr.cmd) {
++		dev_dbg(&serdev->dev,
++			"bad responded CMD code in gate-resp(cmd: %d)\n",
++			resp->hdr.cmd);
++		PIBRIDGE_INC_STATS(rx_gate_format_inval);
++		PIBRIDGE_INC_STATS(rx_err);
++		return -EBADMSG;
++	}
++	/* Either OK or ERR flag must be set. */
++	if ((resp->hdr.cmd & (PIBRIDGE_RESP_OK | PIBRIDGE_RESP_ERR)) == 0) {
++		dev_dbg(&serdev->dev,
++			"No RESP flag set in gate-resp(cmd: %d)\n",
++			resp->hdr.cmd);
++		PIBRIDGE_INC_STATS(rx_gate_format_inval);
++		PIBRIDGE_INC_STATS(rx_err);
++		return -EBADMSG;
++	}
++
++	if (resp->hdr.cmd & PIBRIDGE_RESP_ERR) {
++		if (resp->hdr.cmd & PIBRIDGE_RESP_OK) {
++			/* Both flags must not be set. */
++			dev_dbg(&serdev->dev,
++				"ERR and OK flag set in gate-resp(cmd: %d)\n",
++				resp->hdr.cmd);
++			PIBRIDGE_INC_STATS(rx_gate_format_inval);
++			PIBRIDGE_INC_STATS(rx_err);
++			return -EBADMSG;
++		}
++
++		dev_dbg(&serdev->dev, "ERR flag set in gate-resp(cmd: %d)\n",
++			resp->hdr.cmd);
++		PIBRIDGE_INC_STATS(rx_gate_remote_err);
++		PIBRIDGE_INC_STATS(rx_err);
++		return -EBADMSG;
++	}
++	/* Calculate CRC, so we can compare it with the sent CRC. */
++	exp_crc = pibridge_crc8(0, &resp->hdr, sizeof(resp->hdr));
++
++	to_receive = min(resp->hdr.len, PIBRIDGE_MAX_GATE_DATA);
++
++	if (to_receive) {
++		ret = pibridge_recv_timeout_locked(pi, resp->data, to_receive,
++						   PIBRIDGE_GATE_TIMEOUT);
++		if (ret != to_receive) {
++			dev_dbg(&serdev->dev,
++				"failed to receive data: (to receive: %i, returned: %i)\n",
++				to_receive, ret);
++			PIBRIDGE_INC_STATS(rx_gate_data_err);
++			return -EIO;
++		}
++		trace_pibridge_receive_gate_data(resp->data, to_receive);
++		exp_crc = pibridge_crc8(exp_crc, resp->data, to_receive);
++	}
++	/* We got the whole data, now get the CRC. */
++	if (pibridge_recv_locked(pi, &crc, sizeof(u8)) != sizeof(u8)) {
++		dev_dbg(&serdev->dev, "failed to receive CRC in gate-req\n");
++		PIBRIDGE_INC_STATS(rx_gate_crc_err);
++		return -EIO;
++	}
++
++	trace_pibridge_receive_gate_crc(crc, exp_crc);
++	/* Compare calculated CRC with received CRC. */
++	if (crc != exp_crc) {
++		dev_dbg(&serdev->dev,
++			"invalid checksum (expected: 0x%02x, got 0x%02x)\n",
++			exp_crc, crc);
++		PIBRIDGE_INC_STATS(rx_gate_crc_inval);
++		PIBRIDGE_INC_STATS(rx_err);
++		return -EBADMSG;
++	}
++	/* Store CRC for the caller. */
++	resp->data[resp->hdr.len] = crc;
++
++	return sizeof(resp->hdr) + to_receive;
++}
++
++int pibridge_req_gate_datagram(struct pibridge *pi,
++			       struct pibridge_gate_datagram *req,
++			       struct pibridge_gate_datagram *resp)
++{
++	int ret;
++
++	mutex_lock(&pibridge_dev_mutex);
++	ret = pibridge_req_gate_datagram_locked(pi, req, resp);
++	mutex_unlock(&pibridge_dev_mutex);
++
++	return ret;
++}
++EXPORT_SYMBOL(pibridge_req_gate_datagram);
++
++static int pibridge_req_gate_tmt_locked(struct pibridge *pi, u8 dst, u16 cmd,
++					void *snd_buf, u8 snd_len,
++					void *rcv_buf, u8 rcv_len, u16 tmt)
++{
++	struct serdev_device *serdev = pi->serdev;
++	struct pibridge_pkthdr_gate pkthdr;
++	u8 to_receive;
++	u8 to_discard;
++	u8 crc_rcv;
++	u8 crc;
++
++	/* Read fifo may contain stale data, so clear it first */
++	pibridge_clear_fifo(pi);
++
++	if (pibridge_req_send_gate_locked(pi, dst, cmd, snd_buf, snd_len)) {
++		dev_dbg(&serdev->dev,
++			"send message error in gate-req(dst: %d, cmd: %d, len: %d)\n",
++			dst, cmd, snd_len);
++		return -EIO;
++	}
++	/* Do not wait for a response in case of a broadcast address */
++	if (dst == PIBRIDGE_BC_ADDR)
++		return 0;
++
++	if (pibridge_recv_timeout_locked(pi, &pkthdr, sizeof(pkthdr), tmt) !=
++	    sizeof(pkthdr)) {
++		dev_dbg(&serdev->dev,
++			"receive head error in gate-req(hdr_len: %zd, timeout: %d, data0: %c)\n",
++			sizeof(pkthdr), tmt, snd_buf ? ((u8 *)snd_buf)[0] : 0);
++		PIBRIDGE_INC_STATS(rx_gate_hdr_err);
++		return -EIO;
++	}
++
++	trace_pibridge_receive_gate_header(&pkthdr);
++
++	if ((pkthdr.cmd & PIBRIDGE_RESP_CMD) != cmd) {
++		dev_dbg(&serdev->dev,
++			"bad responded CMD code in gate-req(cmd: %d)\n",
++			pkthdr.cmd);
++		PIBRIDGE_INC_STATS(rx_gate_format_inval);
++		PIBRIDGE_INC_STATS(rx_err);
++		return -EBADMSG;
++	}
++
++	/* Either OK or ERR flag must be set. */
++	if ((pkthdr.cmd & (PIBRIDGE_RESP_OK | PIBRIDGE_RESP_ERR)) == 0) {
++		dev_dbg(&serdev->dev,
++			"No RESP flag set in gate-req(cmd: %d)\n", pkthdr.cmd);
++		PIBRIDGE_INC_STATS(rx_gate_format_inval);
++		PIBRIDGE_INC_STATS(rx_err);
++		return -EBADMSG;
++	}
++
++	if (pkthdr.cmd & PIBRIDGE_RESP_ERR) {
++		if (pkthdr.cmd & PIBRIDGE_RESP_OK) {
++			/* Both flags must not be set. */
++			dev_dbg(&serdev->dev,
++				"ERR and OK flag set in gate-req(cmd: %d)\n",
++				pkthdr.cmd);
++			PIBRIDGE_INC_STATS(rx_gate_format_inval);
++			PIBRIDGE_INC_STATS(rx_err);
++			return -EBADMSG;
++		}
++
++		dev_dbg(&serdev->dev, "ERR flag set in gate-req(cmd: %d)\n",
++			pkthdr.cmd);
++		PIBRIDGE_INC_STATS(rx_gate_remote_err);
++		PIBRIDGE_INC_STATS(rx_err);
++		return -EBADMSG;
++	}
++
++	crc = pibridge_crc8(0, &pkthdr, sizeof(pkthdr));
++
++	to_receive = min(pkthdr.len, rcv_len);
++	to_discard = pkthdr.len - to_receive;
++
++	if (to_receive) {
++		if (pibridge_recv_timeout_locked(pi, rcv_buf, to_receive, tmt) !=
++		    to_receive) {
++			dev_dbg(&serdev->dev,
++				"receive data error in gate-req(len: %d)\n",
++				to_receive);
++			PIBRIDGE_INC_STATS(rx_gate_data_err);
++			return -EIO;
++		}
++		trace_pibridge_receive_gate_data(rcv_buf, to_receive);
++		crc = pibridge_crc8(crc, rcv_buf, to_receive);
++	}
++
++	if (to_discard) {
++		/*
++		 * The provided buffer was too small. Discard the rest of the
++		 * received data as well as the following CRC checksum byte.
++		 */
++		if (pibridge_discard_timeout(pi, to_discard + PIBRIDGE_CRC_LEN,
++					     tmt))
++			dev_dbg(&serdev->dev,
++				"failed to discard %u bytes within timeout\n",
++				to_discard);
++		dev_dbg(&serdev->dev,
++			"received packet truncated (%u bytes missing)\n",
++			to_discard);
++		PIBRIDGE_ADD_STATS(rx_gate_discarded, to_discard);
++		PIBRIDGE_INC_STATS(rx_err);
++		return -EIO;
++	}
++	/* We got the whole data, now get the CRC */
++	if (pibridge_recv_timeout_locked(pi, &crc_rcv, sizeof(u8), tmt) !=
++	    sizeof(u8)) {
++		dev_dbg(&serdev->dev, "failed to receive CRC in gate-req\n");
++		PIBRIDGE_INC_STATS(rx_gate_crc_err);
++		return -EIO;
++	}
++
++	trace_pibridge_receive_gate_crc(crc_rcv, crc);
++
++	if (crc != crc_rcv) {
++		dev_dbg(&serdev->dev,
++			"invalid checksum (expected: 0x%02x, got 0x%02x)\n",
++			crc, crc_rcv);
++		PIBRIDGE_INC_STATS(rx_gate_crc_inval);
++		PIBRIDGE_INC_STATS(rx_err);
++		return -EBADMSG;
++	}
++
++	return to_receive;
++}
++
++int pibridge_req_gate_tmt(struct pibridge *pi, u8 dst, u16 cmd, void *snd_buf,
++			  u8 snd_len, void *rcv_buf, u8 rcv_len, u16 tmt)
++{
++	int ret;
++
++	mutex_lock(&pibridge_dev_mutex);
++	ret = pibridge_req_gate_tmt_locked(pi, dst, cmd, snd_buf, snd_len,
++					   rcv_buf, rcv_len, tmt);
++	mutex_unlock(&pibridge_dev_mutex);
++
++	return ret;
++}
++EXPORT_SYMBOL(pibridge_req_gate_tmt);
++
++static int pibridge_req_gate_locked(struct pibridge *pi, u8 dst, u16 cmd,
++				    void *snd_buf, u8 snd_len, void *rcv_buf,
++				    u8 rcv_len)
++{
++	return pibridge_req_gate_tmt_locked(pi, dst, cmd, snd_buf, snd_len,
++					    rcv_buf, rcv_len,
++					    PIBRIDGE_GATE_TIMEOUT);
++}
++
++int pibridge_req_gate(struct pibridge *pi, u8 dst, u16 cmd, void *snd_buf,
++		      u8 snd_len, void *rcv_buf, u8 rcv_len)
++{
++	int ret;
++
++	mutex_lock(&pibridge_dev_mutex);
++	ret = pibridge_req_gate_locked(pi, dst, cmd, snd_buf, snd_len, rcv_buf,
++				       rcv_len);
++	mutex_unlock(&pibridge_dev_mutex);
++
++	return ret;
++}
++
++EXPORT_SYMBOL(pibridge_req_gate);
++
++static int pibridge_req_send_io_locked(struct pibridge *pi, u8 addr, u8 cmd,
++				       void *snd_buf, u8 buf_len)
++{
++	struct serdev_device *serdev = pi->serdev;
++	struct pibridge_pkthdr_io *hdr;
++	size_t datagram_size;
++	void *datagram;
++	int ret = 0;
++	u8 crc;
++
++	datagram_size = sizeof(*hdr) + buf_len + PIBRIDGE_CRC_LEN;
++
++	datagram = kmalloc(datagram_size, GFP_KERNEL);
++	if (!datagram) {
++		PIBRIDGE_INC_STATS(tx_io_err);
++		PIBRIDGE_INC_STATS(tx_err);
++		return -ENOMEM;
++	}
++
++	hdr = (struct pibridge_pkthdr_io *) datagram;
++	hdr->addr = addr;
++	hdr->type = (addr == 0x3f) ? 1 : 0; /* 0 for unicast, 1 for broadcast */
++	hdr->rsp = 0;
++	hdr->len = buf_len;
++	hdr->cmd = cmd;
++
++	crc = pibridge_crc8(0, hdr, sizeof(*hdr));
++
++	if (buf_len) {
++		memcpy(datagram + sizeof(*hdr), snd_buf, buf_len);
++		crc = pibridge_crc8(crc, snd_buf, buf_len);
++	}
++
++	memcpy(datagram + sizeof(*hdr) + buf_len, &crc, sizeof(crc));
++
++	if (pibridge_send_locked(pi, datagram, datagram_size) < 0) {
++		PIBRIDGE_INC_STATS(tx_io_err);
++		dev_dbg(&serdev->dev, "failed to send io-datagram\n");
++		ret = -EIO;
++	}
++
++	kfree(datagram);
++
++	return ret;
++}
++
++int pibridge_req_send_io(struct pibridge *pi, u8 addr, u8 cmd, void *snd_buf,
++			 u8 buf_len)
++{
++	int ret;
++
++	mutex_lock(&pibridge_dev_mutex);
++	ret = pibridge_req_send_io_locked(pi, addr, cmd, snd_buf, buf_len);
++	mutex_unlock(&pibridge_dev_mutex);
++
++	return ret;
++}
++EXPORT_SYMBOL(pibridge_req_send_io);
++
++static int pibridge_req_io_locked(struct pibridge *pi, u8 addr, u8 cmd,
++				  void *snd_buf, u8 snd_len, void *rcv_buf,
++				  u8 rcv_len)
++{
++	struct serdev_device *serdev = pi->serdev;
++	struct pibridge_pkthdr_io pkthdr;
++	u8 to_receive;
++	u8 to_discard;
++	u8 crc_rcv;
++	u8 crc;
++
++	/* Read fifo may contain stale data, so clear it first */
++	pibridge_clear_fifo(pi);
++
++	if (pibridge_req_send_io_locked(pi, addr, cmd, snd_buf, snd_len)) {
++		dev_dbg(&serdev->dev,
++			"send message error in io-req(addr: %d, cmd: %d, len: %d)\n",
++			addr, cmd, snd_len);
++		return -EIO;
++	}
++
++	if (pibridge_recv_locked(pi, &pkthdr, sizeof(pkthdr)) != sizeof(pkthdr)) {
++		dev_dbg(&serdev->dev, "receive head error in io-req\n");
++		PIBRIDGE_INC_STATS(rx_io_hdr_err);
++		return -EIO;
++	}
++
++	trace_pibridge_receive_io_header(&pkthdr);
++
++	if (pkthdr.addr != addr) {
++		dev_dbg(&serdev->dev, "unexpected response addr 0x%02x\n",
++			pkthdr.addr);
++		PIBRIDGE_INC_STATS(rx_io_format_inval);
++		PIBRIDGE_INC_STATS(rx_err);
++		return -EBADMSG;
++	}
++
++	if (!pkthdr.rsp) {
++		dev_dbg(&serdev->dev,
++			"response flag not set in received packet\n");
++		PIBRIDGE_INC_STATS(rx_io_format_inval);
++		PIBRIDGE_INC_STATS(rx_err);
++		return -EBADMSG;
++	}
++
++	crc = pibridge_crc8(0, &pkthdr, sizeof(pkthdr));
++
++	to_receive = min((u8) pkthdr.len, rcv_len);
++	to_discard = pkthdr.len - to_receive;
++
++	if (to_receive) {
++		if (pibridge_recv_locked(pi, rcv_buf, to_receive) != to_receive) {
++			dev_dbg(&serdev->dev,
++				"receive data error in io-req(len: %d)\n",
++				to_receive);
++			PIBRIDGE_INC_STATS(rx_io_data_err);
++			return -EIO;
++		}
++		trace_pibridge_receive_io_data(rcv_buf, to_receive);
++		crc = pibridge_crc8(crc, rcv_buf, to_receive);
++	}
++
++	if (to_discard) {
++		/*
++		 * The provided buffer was too small. Discard the rest of the
++		 * received data as well as the following CRC checksum byte.
++		 */
++		if (pibridge_discard_timeout(pi, to_discard + PIBRIDGE_CRC_LEN,
++					     pibridge_io_timeout))
++			dev_dbg(&serdev->dev,
++				"failed to discard %u bytes within timeout\n",
++				to_discard);
++
++		dev_dbg(&serdev->dev,
++			"received packet truncated (%u bytes missing)\n",
++			to_discard);
++		PIBRIDGE_ADD_STATS(rx_io_discarded, to_discard);
++		PIBRIDGE_INC_STATS(rx_err);
++		return -EIO;
++	}
++	/* We got the whole data, now get the CRC */
++	if (pibridge_recv_locked(pi, &crc_rcv, sizeof(u8)) != sizeof(u8)) {
++		dev_dbg(&serdev->dev, "receive crc error in io-req\n");
++		PIBRIDGE_INC_STATS(rx_io_crc_err);
++		return -EIO;
++	}
++
++	trace_pibridge_receive_io_crc(crc_rcv, crc);
++
++	if (crc != crc_rcv) {
++		dev_dbg(&serdev->dev,
++			"invalid checksum (expected: 0x%02x, got 0x%02x)\n",
++			crc, crc_rcv);
++		PIBRIDGE_INC_STATS(rx_io_crc_inval);
++		PIBRIDGE_INC_STATS(rx_err);
++		return -EBADMSG;
++	}
++
++
++	return to_receive;
++}
++
++int pibridge_req_io(struct pibridge *pi, u8 addr, u8 cmd, void *snd_buf,
++		    u8 snd_len, void *rcv_buf, u8 rcv_len)
++{
++	int ret;
++
++	mutex_lock(&pibridge_dev_mutex);
++	ret = pibridge_req_io_locked(pi, addr, cmd, snd_buf, snd_len, rcv_buf,
++				     rcv_len);
++	mutex_unlock(&pibridge_dev_mutex);
++
++	return ret;
++}
++EXPORT_SYMBOL(pibridge_req_io);
++
++struct pibridge *pibridge_get(void)
++{
++	struct pibridge *pb;
++
++	mutex_lock(&pibridge_dev_mutex);
++	pb = pibridge_s;
++	mutex_unlock(&pibridge_dev_mutex);
++
++	return pb;
++}
++EXPORT_SYMBOL(pibridge_get);
++
++#ifdef CONFIG_OF
++static const struct of_device_id pibridge_of_match[] = {
++	{ .compatible = "kunbus,pi-bridge" },
++	{},
++};
++MODULE_DEVICE_TABLE(of, pibridge_of_match);
++#endif
++
++static struct serdev_device_driver pibridge_driver = {
++	.driver	= {
++		.name		= "pi-bridge",
++		.groups = pibridge_drv_groups,
++		.of_match_table	= of_match_ptr(pibridge_of_match),
++	},
++	.probe	= pibridge_probe,
++	.remove	= pibridge_remove,
++};
++module_serdev_device_driver(pibridge_driver);
++
++module_param(pibridge_baudrate, int, 0444);
++MODULE_PARM_DESC(pibridge_baudrate, "Baudrate for PiBridge UART");
++
++module_param(pibridge_io_timeout, int, 0644);
++MODULE_PARM_DESC(pibridge_io_timeout, "IO timeout in milliseconds for receiving PiBridge telegrams");
++
++MODULE_DESCRIPTION("Revolution Pi PiBridge serial device driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/tty/serdev/pibridge.h b/drivers/tty/serdev/pibridge.h
+new file mode 100644
+index 0000000..a44f60f
+--- /dev/null
++++ b/drivers/tty/serdev/pibridge.h
+@@ -0,0 +1,16 @@
++#ifndef DRIVERS_PIBRIDGE_H
++#define DRIVERS_PIBRIDGE_H
++
++#include <linux/types.h>
++
++#define PIBRIDGE_RECV_FIFO_SIZE		512
++
++struct pibridge_pkthdr_io {
++	u8 addr	:6;
++	u8 type	:1;	/* 0 for unicast, 1 for broadcast */
++	u8 rsp	:1;	/* 0 for request, 1 for response */
++	u8 len	:5;
++	u8 cmd	:3;	/* 0 for broadcast*/
++} __attribute__((packed));
++
++#endif /* DRIVERS_PIBRIDGE_H */
+diff --git a/drivers/tty/serdev/pibridge_trace.h b/drivers/tty/serdev/pibridge_trace.h
+new file mode 100644
+index 0000000..6c81169
+--- /dev/null
++++ b/drivers/tty/serdev/pibridge_trace.h
+@@ -0,0 +1,436 @@
++#undef TRACE_SYSTEM
++#define TRACE_SYSTEM pibridge
++
++#if !defined(_PIBRIDGE_TRACE_H) || defined(TRACE_HEADER_MULTI_READ)
++#define _PIBRIDGE_TRACE_H
++
++#include <linux/tracepoint.h>
++#include <linux/serdev.h>
++#include <linux/kfifo.h>
++
++#include "pibridge.h"
++
++#define PIBRIDGE_TRACE_MAX_FIFO_DUMP		128
++#define PIBRIDGE_TRACE_MAX_PACKET_DATA_LEN	256
++
++/*
++ * pibridge_gate_header_class
++ *
++ * Print the elements of a gateway header.
++ *
++ * dst: destination address. Specifies to which RevPi device the packet is sent.
++ * src: source address of the sending device.
++ * cmd: command issued by this header.
++ * seq: sequence number of this packet.
++ * len: packet length.
++ */
++DECLARE_EVENT_CLASS(pibridge_gate_header_class,
++	TP_PROTO(struct pibridge_pkthdr_gate *hdr),
++	TP_ARGS(hdr),
++	TP_STRUCT__entry(
++		__field(u8, dst)
++		__field(u8, src)
++		__field(u16, cmd)
++		__field(u16, seq)
++		__field(u8, len)
++	),
++	TP_fast_assign(
++		__entry->dst = hdr->dst;
++		__entry->src = hdr->src;
++		__entry->cmd = hdr->cmd;
++		__entry->seq = hdr->seq;
++		__entry->len = hdr->len;
++	),
++	TP_printk(
++		"dst=%u src=%u cmd=0x%04x seq=%u len=%u",
++		__entry->dst,
++		__entry->src,
++		__entry->cmd,
++		__entry->seq,
++		__entry->len
++	)
++);
++
++/*
++ * pibridge_receive_gate_header
++ *
++ * Info: the header of a received gateway packet.
++ * Time: after the gate packet header was received from the wire.
++ */
++DEFINE_EVENT(pibridge_gate_header_class, pibridge_receive_gate_header,
++	TP_PROTO(struct pibridge_pkthdr_gate *hdr),
++	TP_ARGS(hdr)
++);
++
++/*
++ * pibridge_io_header_class
++ *
++ * Print the elements of an IO packet header.
++ *
++ * addr: destination address. Specifies to which RevPi device the packet is
++ *       sent.
++ * type: packet type (unicast or broadcast).
++ * rsp: specifies if this message is a request or a response.
++ * len: packet length.
++ * cmd: command issued by this header.
++ */
++DECLARE_EVENT_CLASS(pibridge_io_header_class,
++	TP_PROTO(struct pibridge_pkthdr_io *hdr),
++	TP_ARGS(hdr),
++	TP_STRUCT__entry(
++		__field(u8, addr)
++		__field(u8, type)
++		__field(u8, rsp)
++		__field(u8, len)
++		__field(u8, cmd)
++	),
++	TP_fast_assign(
++		__entry->addr = hdr->addr;
++		__entry->type = hdr->type;
++		__entry->rsp = hdr->rsp;
++		__entry->len = hdr->len;
++		__entry->cmd = hdr->cmd;
++	),
++	TP_printk(
++		"addr=%u type=%u rsp=%u len=%u cmd=%u",
++		__entry->addr,
++		__entry->type,
++		__entry->rsp,
++		__entry->len,
++		__entry->cmd)
++);
++
++/*
++ * pibridge_receive_io_header
++ *
++ * Info: the header of a received IO packet.
++ * Time: after the header of an IO response packet has been received.
++ */
++DEFINE_EVENT(pibridge_io_header_class, pibridge_receive_io_header,
++	TP_PROTO(struct pibridge_pkthdr_io *hdr),
++	TP_ARGS(hdr)
++);
++
++/*
++ * pibridge_receive_crc_class
++ *
++ * Print the CRC that is part of a received packet as well as the expected CRC
++ * that has been calculated for this packet.
++ *
++ * crc: CRC received with the packet
++ * exp_crc: expected CRC as calculated for the received packet.
++ */
++DECLARE_EVENT_CLASS(pibridge_receive_crc_class,
++	TP_PROTO(u8 crc, u8 exp_crc),
++	TP_ARGS(crc, exp_crc),
++	TP_STRUCT__entry(
++		__field(u8, crc)
++		__field(u8, exp_crc)
++	),
++	TP_fast_assign(
++		__entry->crc = crc;
++		__entry->exp_crc = exp_crc;
++	),
++	TP_printk(
++		"crc=0x%02x (exp=0x%02x)",
++		__entry->crc,
++		__entry->exp_crc
++	)
++);
++
++/*
++ * pibridge_receive_io_crc
++ *
++ * Info: the CRC that is part of the received IO packet.
++ * Time: after the CRC of an IO packet has been received.
++ */
++DEFINE_EVENT(pibridge_receive_crc_class, pibridge_receive_io_crc,
++	TP_PROTO(u8 crc, u8 exp_crc),
++	TP_ARGS(crc, exp_crc)
++);
++
++/*
++ * pibridge_receive_gate_crc
++ *
++ * Info: the CRC that is part of the received gateway packet.
++ * Time: after the CRC of a gateway packet has been received.
++ */
++DEFINE_EVENT(pibridge_receive_crc_class, pibridge_receive_gate_crc,
++	TP_PROTO(u8 crc, u8 exp_crc),
++	TP_ARGS(crc, exp_crc)
++);
++
++/*
++ * pibridge_buffer_data_class
++ *
++ * Print a data buffer and the buffer length.
++ *
++ * buffer: data bytes.
++ * len: number of data bytes.
++ */
++DECLARE_EVENT_CLASS(pibridge_buffer_data_class,
++	TP_PROTO(const unsigned char *buffer, unsigned int len),
++	TP_ARGS(buffer, len),
++	TP_STRUCT__entry(
++		__array(const unsigned char *, buffer,
++			PIBRIDGE_TRACE_MAX_PACKET_DATA_LEN)
++		__field(unsigned int, len)
++	),
++	TP_fast_assign(
++		memcpy(__entry->buffer, buffer, len);
++		__entry->len = len;
++	),
++	TP_printk(
++		"datalen=%d data:%s",
++		__entry->len,
++		__print_array(__entry->buffer, __entry->len,
++			      sizeof(unsigned char))
++	)
++);
++
++/*
++ * pibridge_receive_io_data
++ *
++ * Info: the payload data received with an IO response packet. If the packet is
++ *       larger than expected, only the expected number of bytes is emitted.
++ *       Excess bytes are discarded, see pibridge_discard_data and
++ *       pibridge_discard_timeout events.
++ * Time: after the data bytes of an IO response packet have been received.
++ */
++DEFINE_EVENT(pibridge_buffer_data_class, pibridge_receive_io_data,
++	TP_PROTO(const unsigned char *buffer, unsigned int len),
++	TP_ARGS(buffer, len)
++);
++
++/*
++ * pibridge_receive_gate_data
++ *
++ * Info: the payload data received with a gateway response packet. If the packet
++ *       is larger than expected, only the expected number of bytes is emitted.
++ *       Excess bytes are discarded, see pibridge_discard_data and
++ *       pibridge_discard_timeout events.
++ * Time: after the data bytes of a gateway response packet have been received.
++ */
++DEFINE_EVENT(pibridge_buffer_data_class, pibridge_receive_gate_data,
++	TP_PROTO(const unsigned char *buffer, unsigned int len),
++	TP_ARGS(buffer, len)
++);
++
++/*
++ * pibridge_send_begin
++ *
++ * Info: the bytes to send in raw format.
++ * Time: before the bytes are sent on the wire.
++ */
++DEFINE_EVENT(pibridge_buffer_data_class, pibridge_send_begin,
++	TP_PROTO(const unsigned char *buffer, unsigned int len),
++	TP_ARGS(buffer, len)
++);
++
++/*
++ * pibridge_receive_end
++ *
++ * Info: received bytes in raw format.
++ * Time: after the expected number of bytes has been received or a timeout
++ *       occurred.
++ */
++DEFINE_EVENT(pibridge_buffer_data_class, pibridge_receive_end,
++	TP_PROTO(const unsigned char *buffer, unsigned int len),
++	TP_ARGS(buffer, len)
++);
++
++/*
++ * pibridge_wakeup_receive_buffer
++ *
++ * Info: received bytes in raw format.
++ * Time: after a chunk of bytes has been received from the serial line following
++ *       a notification by the serdev layer.
++ */
++DEFINE_EVENT(pibridge_buffer_data_class, pibridge_wakeup_receive_buffer,
++	TP_PROTO(const unsigned char *buffer, unsigned int len),
++	TP_ARGS(buffer, len)
++);
++
++/*
++ * pibridge_timeout_class
++ *
++ * Print the number of bytes received within a timeout. Also print the timeout
++ * itself and the number of bytes that were expected to be received.
++ *
++ * received: number of received bytes when the timeout occurred.
++ * expected: number of bytes expected before timeout expiration.
++ * timeout: timespan until the timeout.
++ */
++DECLARE_EVENT_CLASS(pibridge_timeout_class,
++	TP_PROTO(unsigned int received, unsigned int expected,
++		 unsigned int timeout),
++	TP_ARGS(received, expected, timeout),
++	TP_STRUCT__entry(
++		__field(unsigned int, received)
++		__field(unsigned int, expected)
++		__field(unsigned int, timeout)
++	),
++	TP_fast_assign(
++		__entry->received = received;
++		__entry->expected = expected;
++		__entry->timeout = timeout;
++	),
++	TP_printk(
++		"received: %u, expected: %u, timeout: %u",
++		__entry->received,
++		__entry->expected,
++		__entry->timeout
++	)
++);
++
++/*
++ * pibridge_receive_timeout
++ *
++ * Info: timeout occurred while waiting for data reception.
++ * Time: after the timeout occurred.
++ */
++DEFINE_EVENT(pibridge_timeout_class, pibridge_receive_timeout,
++	TP_PROTO(unsigned int received, unsigned int expected,
++		 unsigned int timeout),
++	TP_ARGS(received, expected, timeout)
++);
++
++/*
++ * pibridge_discard_timeout
++
++ * Info: a timeout occurred while waiting for excess data (of a larger than
++ *       expected packet) that was to be discarded.
++ * Time: after the timeout occurred.
++ */
++DEFINE_EVENT(pibridge_timeout_class, pibridge_discard_timeout,
++	TP_PROTO(unsigned int received, unsigned int expected,
++		 unsigned int timeout),
++	TP_ARGS(received, expected, timeout)
++);
++
++/*
++ * pibridge_serdev_name_class
++ *
++ * Print the serdev device name.
++ *
++ * serdev: serdev device to print the name for.
++ */
++DECLARE_EVENT_CLASS(pibridge_serdev_name_class,
++	TP_PROTO(struct serdev_device *serdev),
++	TP_ARGS(serdev),
++	TP_STRUCT__entry(
++		__string(name, dev_name(&serdev->dev))
++	),
++	TP_fast_assign(
++		__assign_str(name);
++	),
++	TP_printk(
++		"Serdev %s",
++		__get_str(name)
++	)
++);
++
++/*
++ * pibridge_wakeup_write
++ *
++ * Info: the serdev device that is notified by the serdev subsystem that it is
++ *       ready to write more data.
++ * Time: at notification by the serdev subsystem.
++ */
++DEFINE_EVENT(pibridge_serdev_name_class, pibridge_wakeup_write,
++	TP_PROTO(struct serdev_device *serdev),
++	TP_ARGS(serdev)
++);
++
++/*
++ * pibridge_data_len_class
++ *
++ * len: the number of bytes.
++ */
++DECLARE_EVENT_CLASS(pibridge_data_len_class,
++	TP_PROTO(unsigned int len),
++	TP_ARGS(len),
++	TP_STRUCT__entry(
++		__field(unsigned int, len)
++	),
++	TP_fast_assign(
++		__entry->len = len;
++	),
++	TP_printk(
++		"datalen=%d",
++		__entry->len
++	)
++);
++
++/*
++ * pibridge_send_end
++ *
++ * Info: the number of bytes sent.
++ * Time: after the bytes have been sent.
++ */
++DEFINE_EVENT(pibridge_data_len_class, pibridge_send_end,
++	TP_PROTO(unsigned int len),
++	TP_ARGS(len)
++);
++
++/*
++ * pibridge_receive_begin
++ *
++ * Info: the number of bytes expected to be received.
++ * Time: before waiting for data reception.
++ */
++DEFINE_EVENT(pibridge_data_len_class, pibridge_receive_begin,
++	TP_PROTO(unsigned int len),
++	TP_ARGS(len)
++);
++
++/*
++ * pibridge_kfifo_data_class
++ *
++ * Print the data contained in the receive fifo and its size in bytes.
++ *
++ * len: number of bytes stored in the receive fifo.
++ * data: data stored in the receive fifo.
++ */
++DECLARE_EVENT_CLASS(pibridge_kfifo_data_class,
++	TP_PROTO(struct kfifo *fifo),
++	TP_ARGS(fifo),
++	TP_STRUCT__entry(
++		__field(unsigned int, len)
++		__array(unsigned char *, buffer, PIBRIDGE_RECV_FIFO_SIZE)
++	),
++	TP_fast_assign(
++		__entry->len = kfifo_out_peek(fifo, __entry->buffer,
++					      PIBRIDGE_RECV_FIFO_SIZE)
++	),
++	TP_printk(
++		"fifo (len=%u) data=%s",
++		__entry->len,
++		__print_array(__entry->buffer,
++			      __entry->len > PIBRIDGE_RECV_FIFO_SIZE ?
++					PIBRIDGE_RECV_FIFO_SIZE : __entry->len,
++			      sizeof(unsigned char))
++	)
++);
++
++/*
++ * pibridge_discard_data
++ *
++ * Info: the bytes contained in the receive fifo being discarded.
++ * Time: after the excess bytes of a larger than expected packet have been
++ *       discarded or a timeout occurred while waiting for the data which
++ *       was going to be discarded.
++ */
++DEFINE_EVENT(pibridge_kfifo_data_class, pibridge_discard_data,
++	TP_PROTO(struct kfifo *fifo),
++	TP_ARGS(fifo)
++);
++
++#endif /* _PIBRIDGE_TRACE_H */
++
++/* This part must be outside protection */
++#undef TRACE_INCLUDE_PATH
++#define TRACE_INCLUDE_PATH .
++#undef TRACE_INCLUDE_FILE
++#define TRACE_INCLUDE_FILE pibridge_trace
++#include <trace/define_trace.h>
+diff --git a/include/linux/pibridge_comm.h b/include/linux/pibridge_comm.h
+new file mode 100644
+index 0000000..50653e1
+--- /dev/null
++++ b/include/linux/pibridge_comm.h
+@@ -0,0 +1,79 @@
++#ifndef _PIBRIDGE_COMM_H
++#define _PIBRIDGE_COMM_H
++
++#include <linux/types.h>
++#include <linux/u64_stats_sync.h>
++#include <linux/kfifo.h>
++#include <linux/wait.h>
++
++
++struct pibridge_stats;
++
++struct pibridge_pkthdr_gate {
++	u8	dst;
++	u8	src;
++	u16	cmd;
++	u16	seq;
++	u8	len;
++} __attribute__((packed));
++
++#define PIBRIDGE_MAX_GATE_DATA		255
++#define PIBRIDGE_CRC_LEN		1
++
++struct pibridge_stats {
++	u64 tx_bytes;
++	u64 tx_err;
++	u64 tx_io_err;
++	u64 tx_gate_err;
++	u64 rx_bytes;
++	u64 rx_err;
++	u64 rx_gate_hdr_err;
++	u64 rx_gate_data_err;
++	u64 rx_gate_crc_err;
++	u64 rx_gate_crc_inval;
++	u64 rx_gate_format_inval;
++	u64 rx_gate_discarded;
++	u64 rx_gate_remote_err;
++	u64 rx_io_hdr_err;
++	u64 rx_io_data_err;
++	u64 rx_io_crc_err;
++	u64 rx_io_crc_inval;
++	u64 rx_io_format_inval;
++	u64 rx_io_discarded;
++
++	struct u64_stats_sync syncp;
++};
++
++struct pibridge {
++	struct serdev_device *serdev;
++	struct mutex lock;
++	struct kfifo read_fifo;
++	wait_queue_head_t read_queue;
++	struct pibridge_stats stats;
++};
++
++struct pibridge_gate_datagram {
++	struct pibridge_pkthdr_gate hdr;
++	u8 data[PIBRIDGE_MAX_GATE_DATA + PIBRIDGE_CRC_LEN];
++} __attribute__((packed));
++
++
++struct pibridge *pibridge_get(void);
++int pibridge_req_io(struct pibridge *pi, u8 addr, u8 cmd, void *snd_buf,
++		    u8 snd_len, void *rcv_buf, u8 rcv_len);
++int pibridge_req_send_io(struct pibridge *pi, u8 addr, u8 cmd, void *snd_buf,
++			 u8 buf_len);
++int pibridge_req_gate_datagram(struct pibridge *pi,
++			       struct pibridge_gate_datagram *req,
++			       struct pibridge_gate_datagram *resp);
++int pibridge_req_gate_tmt(struct pibridge *pi, u8 dst, u16 cmd, void *snd_buf,
++			  u8 snd_len, void *rcv_buf, u8 rcv_len, u16 tmt);
++int pibridge_req_gate(struct pibridge *pi, u8 dst, u16 cmd, void *snd_buf,
++		      u8 snd_len, void *rcv_buf, u8 rcv_len);
++int pibridge_req_send_gate(struct pibridge *pi, u8 dst, u16 cmd, void *snd_buf,
++			   u8 buf_len);
++int pibridge_recv(struct pibridge *pi, void *buf, u8 len);
++int pibridge_recv_timeout(struct pibridge *pi, void *buf, u8 len, u16 timeout);
++int pibridge_send(struct pibridge *pi, void *buf, u32 len);
++void pibridge_clear_fifo(struct pibridge *pi);
++#endif	/* _PIBRIDGE_COMM_H */
+-- 
+2.48.1.windows.1
+
